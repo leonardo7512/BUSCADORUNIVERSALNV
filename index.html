@@ -325,7 +325,15 @@ function logRenderPhotos(host, records) {
             image.alt = label;
             image.loading = 'lazy';
             image.src = id ? `https://drive.google.com/thumbnail?id=${encodeURIComponent(id)}&sz=w600` : url.href;
-            image.onerror = () => image.replaceWith(logElement('p', 'Vista previa no disponible. Puedes abrir el archivo original.'));
+            let previewRetried = false;
+            image.onerror = () => {
+                if (!previewRetried && id) {
+                    previewRetried = true;
+                    setTimeout(() => { if (image.isConnected) image.src = `https://drive.google.com/thumbnail?id=${encodeURIComponent(id)}&sz=w600&retry=${Date.now()}`; }, 400);
+                    return;
+                }
+                image.replaceWith(logElement('p', 'Vista previa no disponible. Puedes abrir el archivo original.'));
+            };
             const open = logElement('button', 'Ampliar');
             open.type = 'button';
             open.onclick = () => logOpenPhoto(label, url, id, open);
@@ -341,24 +349,37 @@ function logRenderPhotos(host, records) {
 
 const logPhotoCache = new Map();
 const logPhotoRequests = new Map();
-async function logFetchPhotos(nv) {
+async function logFetchPhotos(nv, onRetry = () => {}) {
     const key = String(nv).trim().toUpperCase();
     const cached = logPhotoCache.get(key);
     if (cached && Date.now() - cached.time < 60000) return cached.result;
     if (logPhotoRequests.has(key)) return logPhotoRequests.get(key);
     const request = (async () => {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 25000);
-        try {
-            const response = await fetch(`${LOG_PHOTO_SERVICE}?nv=${encodeURIComponent(nv)}`, {signal:controller.signal,redirect:'follow'});
-            if (!response.ok) throw new Error('No se pudo consultar LOG.');
-            const result = await response.json();
-            if (!result.success) throw new Error(result.error || 'LOG no devolvió los archivos de esta NV.');
-            if (!Array.isArray(result.datos)) throw new Error('La respuesta de LOG no contiene una lista de archivos válida.');
-            logPhotoCache.set(key, {time:Date.now(),result});
-            if (logPhotoCache.size > 30) logPhotoCache.delete(logPhotoCache.keys().next().value);
-            return result;
-        } finally { clearTimeout(timeout); }
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), attempt ? 20000 : 15000);
+            try {
+                const response = await fetch(`${LOG_PHOTO_SERVICE}?nv=${encodeURIComponent(nv)}`, {signal:controller.signal,redirect:'follow'});
+                if (!response.ok) {
+                    const error = new Error('No se pudo consultar LOG.');
+                    error.retryable = response.status === 429 || response.status >= 500;
+                    throw error;
+                }
+                const result = await response.json();
+                if (!result.success || !Array.isArray(result.datos)) {
+                    const error = new Error(result.error || 'LOG no devolvió los archivos de esta NV.');
+                    error.retryable = false;
+                    throw error;
+                }
+                logPhotoCache.set(key, {time:Date.now(),result});
+                if (logPhotoCache.size > 30) logPhotoCache.delete(logPhotoCache.keys().next().value);
+                return result;
+            } catch (error) {
+                if (attempt || error.retryable === false) throw error;
+                onRetry();
+            } finally { clearTimeout(timeout); }
+            await new Promise(resolve => setTimeout(resolve, 600));
+        }
     })().finally(() => logPhotoRequests.delete(key));
     logPhotoRequests.set(key, request);
     return request;
@@ -367,7 +388,9 @@ async function logFetchPhotos(nv) {
 async function logLoadPhotos(host, nv, vendor) {
     host.replaceChildren(logElement('p', 'Cargando fotos y documentos de LOG…', 'log-photo-message'));
     try {
-        const result = await logFetchPhotos(nv);
+        const result = await logFetchPhotos(nv, () => {
+            if (host.isConnected) host.replaceChildren(logElement('p', 'Reconectando con LOG para cargar las fotos…', 'log-photo-message'));
+        });
         if (!host.isConnected) return;
         const records = result.datos.filter(record => String(record.numeroNV).trim().toUpperCase() === String(nv).trim().toUpperCase() && (!vendor || String(record.vendedor || '').trim().toUpperCase() === vendor));
         logRenderPhotos(host, records);
