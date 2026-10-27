@@ -339,16 +339,35 @@ function logRenderPhotos(host, records) {
     if (!count) host.append(logElement('p', 'No hay fotos ni documentos disponibles en la respuesta de LOG para esta NV.', 'log-photo-message'));
 }
 
+const logPhotoCache = new Map();
+const logPhotoRequests = new Map();
+async function logFetchPhotos(nv) {
+    const key = String(nv).trim().toUpperCase();
+    const cached = logPhotoCache.get(key);
+    if (cached && Date.now() - cached.time < 60000) return cached.result;
+    if (logPhotoRequests.has(key)) return logPhotoRequests.get(key);
+    const request = (async () => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 25000);
+        try {
+            const response = await fetch(`${LOG_PHOTO_SERVICE}?nv=${encodeURIComponent(nv)}`, {signal:controller.signal,redirect:'follow'});
+            if (!response.ok) throw new Error('No se pudo consultar LOG.');
+            const result = await response.json();
+            if (!result.success) throw new Error(result.error || 'LOG no devolvió los archivos de esta NV.');
+            if (!Array.isArray(result.datos)) throw new Error('La respuesta de LOG no contiene una lista de archivos válida.');
+            logPhotoCache.set(key, {time:Date.now(),result});
+            if (logPhotoCache.size > 30) logPhotoCache.delete(logPhotoCache.keys().next().value);
+            return result;
+        } finally { clearTimeout(timeout); }
+    })().finally(() => logPhotoRequests.delete(key));
+    logPhotoRequests.set(key, request);
+    return request;
+}
+
 async function logLoadPhotos(host, nv, vendor) {
     host.replaceChildren(logElement('p', 'Cargando fotos y documentos de LOG…', 'log-photo-message'));
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 35000);
     try {
-        const response = await fetch(`${LOG_PHOTO_SERVICE}?nv=${encodeURIComponent(nv)}`, {signal: controller.signal, redirect: 'follow'});
-        if (!response.ok) throw new Error('No se pudo consultar LOG.');
-        const result = await response.json();
-        if (!result.success) throw new Error(result.error || 'LOG no devolvió los archivos de esta NV.');
-        if (!Array.isArray(result.datos)) throw new Error('La respuesta de LOG no contiene una lista de archivos válida.');
+        const result = await logFetchPhotos(nv);
         if (!host.isConnected) return;
         const records = result.datos.filter(record => String(record.numeroNV).trim().toUpperCase() === String(nv).trim().toUpperCase() && (!vendor || String(record.vendedor || '').trim().toUpperCase() === vendor));
         logRenderPhotos(host, records);
@@ -359,7 +378,7 @@ async function logLoadPhotos(host, nv, vendor) {
         retry.type = 'button';
         retry.onclick = () => logLoadPhotos(host, nv, vendor);
         host.append(retry);
-    } finally { clearTimeout(timeout); }
+    }
 }
 
 function logMountGallery(nv, vendor) {
